@@ -1,0 +1,836 @@
+---
+title: "TCGA-LIHC — Integração Clínica e Expressão de Genes de Rede (mRNA/lncRNA + miR-204)"
+author: "Epitácio"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(rtracklayer)
+library(tidyverse)   # inclui dplyr, tidyr, stringr, ggplot2
+library(ggsignif)
+library(DESeq2)
+
+network_nodes <- c("ATM","PRKAA1","PRKAA2","PPM1D","MDM2","TP53","TP53INP1",
+                   "CDKN1A","MALAT1","SIRT1","NLRP3","CASP1","GSDMD","E2F1",
+                   "AKT1","CDK6","CDK4","CCND1","RB1","CDC25A","CDC25B","CDC25C",
+                   "BBC3","BCL2","BAX","CASP3","CASP9")
+
+mirna_alvo <- "hsa-mir-204"
+```
+
+# 1. Download e preparação dos dados (TCGAbiolinks)
+
+Baixa expressão gênica (RNA-seq), expressão de miRNA e dados clínicos do
+projeto TCGA-LIHC, e anota os genes via GFF (GENCODE).
+
+```{r download-data, eval=FALSE}
+#### Retrieving the Expression Data ####
+# Gene expression aligned against hg38
+query <- GDCquery(
+  project = "TCGA-LIHC",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+GDCdownload(query = query)
+data_lihc <- GDCprepare(query = query)
+
+counts <- assay(data_lihc)
+rownames(counts) <- sub("\\..*$", "", rownames(counts))
+counts <- counts %>% rownames_to_column("gene_id")
+
+query.mirnaseq <- GDCquery(
+  project = "TCGA-LIHC",
+  data.category = "Transcriptome Profiling",
+  data.type = "miRNA Expression Quantification",
+  sample.type = c("Primary Tumor", "Solid Tissue Normal")
+)
+GDCdownload(query.mirnaseq, files.per.chunk = 100)
+mirnaseq <- GDCprepare(query.mirnaseq)
+mirnaseq <- mirnaseq %>% column_to_rownames("miRNA_ID")
+
+sum(str_starts(colnames(mirnaseq), "read_count_"))
+mirnaseq_counts <- mirnaseq[, str_starts(colnames(mirnaseq), "read_count_")]
+colnames(mirnaseq_counts) <- gsub("^read_count_", "", colnames(mirnaseq_counts))
+mirnaseq_counts$miRNA_ID <- mirnaseq$miRNA_ID
+
+sum(str_starts(colnames(mirnaseq), "reads_per_million"))
+mirnaseq_rpm <- mirnaseq[, str_starts(colnames(mirnaseq), "reads_per_million")]
+colnames(mirnaseq_rpm) <- gsub("^reads_per_million_miRNA_mapped_", "", colnames(mirnaseq_rpm))
+
+sum(str_starts(colnames(mirnaseq), "cross"))
+mirnaseq_cm <- mirnaseq[, str_starts(colnames(mirnaseq), "cross")]
+colnames(mirnaseq_cm) <- gsub("^cross-mapped_", "", colnames(mirnaseq_cm))
+
+#### Retrieving the Clinical Data ####
+query_clin <- GDCquery(
+  project = "TCGA-LIHC",
+  data.category = "Clinical",
+  data.type = "Clinical Supplement",
+  data.format = "BCR Biotab"
+)
+GDCdownload(query = query_clin)
+clin_lihc <- GDCprepare(query = query_clin)
+
+test <- GDCquery_clinic(project = "TCGA-LIHC", type = "clinical")
+
+## Annotation
+gff <- import.gff3("~/annotation/gencode.v50.annotation.gff3")
+gff <- as.data.frame(gff@elementMetadata)
+gff <- gff[, c("gene_id", "gene_type", "gene_name")]
+gff <- distinct(gff)
+
+gff$gene_id <- sub("\\..*$", "", gff$gene_id)
+
+table(gff$gene_type)
+
+sum(gff$gene_id %in% rownames(counts))
+
+gff <- gff %>% column_to_rownames("gene_id")
+
+counts <- merge(counts, gff, by = "row.names")
+
+# nota: os indices abaixo assumem 427 colunas totais no counts apos o merge
+# (conferido no seu ambiente); se o numero de colunas mudar (ex: anotacao
+# diferente, mais/menos amostras baixadas), confira com ncol(counts) antes
+# de reordenar.
+counts <- counts[, c(427, 426, 1:425)]
+
+# salva em disco para os chunks seguintes (e para renders futuros, sem
+# precisar baixar tudo de novo). Ajuste os caminhos se quiser organizar
+# em outra pasta (ex: "data/counts.RData").
+save(counts, file = "counts.RData")
+save(mirnaseq_counts, file = "mirnaseq_counts.RData")
+save(clin_lihc, test, file = "clin.RData")
+```
+
+**Este chunk está marcado com `eval=FALSE`** porque baixa e processa dados
+pesados via rede (GDC), e reprocessar tudo a cada `knit` seria lento demais.
+Ele **precisa ser rodado manualmente pelo menos uma vez** antes de renderizar
+o documento — no RStudio, abra o `.Rmd`, clique no chunk `download-data` e rode
+com Ctrl+Shift+Enter (ou `Run Chunk`), ou copie o conteúdo pro console. Isso
+vai gerar os arquivos `counts.RData`, `mirnaseq_counts.RData` e `clin.RData` na
+pasta de trabalho. Depois disso, o `knit` normal (que usa o chunk abaixo) já
+encontra os arquivos e funciona sem precisar baixar de novo.
+
+Se preferir que o próprio `knit` faça o download toda vez (sem passo manual),
+troque este chunk para `eval=TRUE` — mas o render vai demorar bem mais.
+
+```{r load-cached-data}
+# Carrega os objetos salvos pelo chunk acima (ajuste os caminhos se voce
+# salvou em outro lugar). Se algum arquivo nao existir, o erro abaixo avisa
+# exatamente qual rodar/gerar antes de tentar o knit de novo.
+carregar_ou_avisar <- function(objeto, arquivo) {
+  # inherits = FALSE: olha SO no .GlobalEnv, ignorando funcoes de mesmo
+  # nome vindas de pacotes carregados (ex: DESeq2::counts() colide com
+  # o nome do objeto "counts" usado aqui)
+  if (!exists(objeto, envir = .GlobalEnv, inherits = FALSE)) {
+    if (!file.exists(arquivo)) {
+      stop("Arquivo '", arquivo, "' nao encontrado. Rode o chunk 'download-data' ",
+           "manualmente (fora do knit) para gera-lo antes de renderizar.")
+    }
+    load(arquivo, envir = .GlobalEnv)
+  }
+}
+
+carregar_ou_avisar("counts", "counts.RData")
+carregar_ou_avisar("mirnaseq_counts", "mirnaseq_counts.RData")
+carregar_ou_avisar("clin_lihc", "clin.RData")
+carregar_ou_avisar("test", "clin.RData")
+```
+
+# 2. Integração das tabelas clínicas
+
+Junta `test` (377 pacientes, GDC) com as 8 tabelas de `clin_lihc` (formato BCR
+biotab) numa única tabela mestre, 1 linha por paciente, com flags/resumos para
+radioterapia, quimioterapia, ablação, outras malignidades e follow-up.
+
+```{r clinical-integration}
+## Chave de paciente: bcr_patient_barcode / submitter_id (formato TCGA-XX-XXXX)
+
+# ------------------------------------------------------------------
+# 0) Limpeza: as tabelas BCR biotab do TCGA trazem 2 linhas de
+#    cabeçalho espúrias (não são pacientes): uma repetindo os nomes
+#    das colunas, outra com "CDE_ID:...". Removemos por padrão.
+# ------------------------------------------------------------------
+clean_bcr <- function(df) {
+  df %>%
+    filter(str_starts(bcr_patient_barcode, "TCGA-"))
+}
+
+patient      <- clean_bcr(clin_lihc$clinical_patient_lihc)
+radiation    <- clean_bcr(clin_lihc$clinical_radiation_lihc)
+drug         <- clean_bcr(clin_lihc$clinical_drug_lihc)
+ablation     <- clean_bcr(clin_lihc$clinical_ablation_lihc)
+omf          <- clean_bcr(clin_lihc$`clinical_omf_v4.0_lihc`)
+nte          <- clean_bcr(clin_lihc$clinical_nte_lihc)
+followup     <- clean_bcr(clin_lihc$`clinical_follow_up_v4.0_lihc`)
+followup_nte <- clean_bcr(clin_lihc$`clinical_follow_up_v4.0_nte_lihc`)
+
+# ------------------------------------------------------------------
+# 1) master = test + colunas novas de clinical_patient_lihc (1:1)
+#    test já tem sua própria bcr_patient_barcode (via GDC); conferimos
+#    que bate com submitter_id antes de usar como chave única.
+# ------------------------------------------------------------------
+stopifnot(all(test$submitter_id == test$bcr_patient_barcode))
+
+master <- test %>%
+  select(-bcr_patient_barcode) %>%
+  rename(bcr_patient_barcode = submitter_id)
+
+only_patient_cols <- setdiff(names(patient), names(master))
+master <- master %>%
+  left_join(patient %>% select(bcr_patient_barcode, all_of(only_patient_cols)),
+            by = "bcr_patient_barcode")
+
+# ------------------------------------------------------------------
+# 2) radiation -- no máximo 1 linha/paciente -> join direto + flag
+# ------------------------------------------------------------------
+rad_small <- radiation %>%
+  select(-bcr_patient_uuid, -bcr_radiation_barcode, -bcr_radiation_uuid,
+         -form_completion_date) %>%
+  rename_with(~ paste0("radio_", .), -bcr_patient_barcode)
+
+master <- master %>%
+  left_join(rad_small, by = "bcr_patient_barcode") %>%
+  mutate(teve_radioterapia = if_else(bcr_patient_barcode %in% radiation$bcr_patient_barcode,
+                                     "Yes", "No"))
+
+# ------------------------------------------------------------------
+# 3) drug -- múltiplas linhas/paciente -> agregação
+#    (base para estratificação por tipo de quimioterapia)
+# ------------------------------------------------------------------
+drug_agg <- drug %>%
+  group_by(bcr_patient_barcode) %>%
+  summarise(
+    n_drogas               = n(),
+    lista_drogas           = paste(sort(unique(na.omit(pharmaceutical_therapy_drug_name))), collapse = "; "),
+    lista_regime           = paste(sort(unique(na.omit(therapy_regimen))), collapse = "; "),
+    lista_classificacao_tx = paste(sort(unique(na.omit(pharmaceutical_therapy_type))), collapse = "; "),
+    melhor_resposta_tx     = paste(sort(unique(na.omit(treatment_best_response))), collapse = "; "),
+    .groups = "drop"
+  )
+
+master <- master %>%
+  left_join(drug_agg, by = "bcr_patient_barcode") %>%
+  mutate(
+    n_drogas    = tidyr::replace_na(n_drogas, 0),
+    teve_quimio = if_else(bcr_patient_barcode %in% drug$bcr_patient_barcode, "Yes", "No")
+  )
+
+# ------------------------------------------------------------------
+# 4) ablation / omf / nte -- flags + contagens simples
+# ------------------------------------------------------------------
+add_flag_count <- function(master, df, label) {
+  cnt <- df %>% count(bcr_patient_barcode, name = paste0("n_", label))
+  master %>%
+    left_join(cnt, by = "bcr_patient_barcode") %>%
+    mutate(!!paste0("n_", label) := tidyr::replace_na(.data[[paste0("n_", label)]], 0),
+           !!paste0("teve_", label) := if_else(.data[[paste0("n_", label)]] > 0, "Yes", "No"))
+}
+
+master <- master %>%
+  add_flag_count(ablation, "ablacao") %>%
+  add_flag_count(omf, "outra_malignidade") %>%
+  add_flag_count(nte, "novo_evento_tumoral")
+
+# ------------------------------------------------------------------
+# 5) follow_up -- registro mais recente por paciente (status vital
+#    e tempo de seguimento atualizados) + contagem de visitas
+# ------------------------------------------------------------------
+latest_fu <- followup %>%
+  mutate(last_contact_days_to_num = suppressWarnings(as.numeric(last_contact_days_to))) %>%
+  group_by(bcr_patient_barcode) %>%
+  slice_max(order_by = last_contact_days_to_num, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(bcr_patient_barcode, tumor_status, vital_status,
+         last_contact_days_to, death_days_to) %>%
+  rename_with(~ paste0("followup_", .), -bcr_patient_barcode)
+
+n_fu <- followup %>% count(bcr_patient_barcode, name = "n_followups")
+
+master <- master %>%
+  left_join(latest_fu, by = "bcr_patient_barcode") %>%
+  left_join(n_fu, by = "bcr_patient_barcode") %>%
+  mutate(n_followups = tidyr::replace_na(n_followups, 0))
+
+# ------------------------------------------------------------------
+# Conferências e saída
+# ------------------------------------------------------------------
+stopifnot(nrow(master) == nrow(test), n_distinct(master$bcr_patient_barcode) == nrow(master))
+
+write.csv(master, "master_clinical_lihc.csv", row.names = FALSE)
+save(master, file = "master_clinical_lihc.RData")
+
+# tabelas longas (limpas) para consulta detalhada quando precisar
+saveRDS(list(patient = patient, radiation = radiation, drug = drug,
+             ablation = ablation, omf = omf, nte = nte,
+             followup = followup, followup_nte = followup_nte),
+        file = "long_tables_lihc.rds")
+
+table(master$teve_quimio)
+table(master$teve_radioterapia)
+```
+
+# 3. mRNAs/lncRNAs da rede: Tumor vs. Normal
+
+Classifica as amostras em Tumor/Normal pelo código do barcode TCGA, normaliza
+(`vst`, DESeq2) usando a matriz completa de genes, e compara os 29 genes da
+rede entre os dois grupos.
+
+```{r mrna-tumor-normal, fig.width=14, fig.height=15}
+## Entrada esperada: data frame `counts` com colunas
+##   gene_name | gene_type | Row.names (ENSG) | <amostras TCGA...>
+## Barcodes no padrão TCGA-XX-XXXX-01A-11R-.... (código de tipo de
+## amostra logo após o 3º "-": 01-09 = tumoral, 10-14 = normal)
+
+## --------------------------------------------------------------
+## 1) Separar metadados de genes (3 primeiras colunas) da matriz
+##    de contagens (amostras)
+## --------------------------------------------------------------
+gene_meta <- counts %>% select(gene_name, gene_type, Row.names)
+sample_cols <- setdiff(names(counts), c("gene_name", "gene_type", "Row.names"))
+
+# checagem: quantos genes da lista existem de fato na tabela
+faltando <- setdiff(network_nodes, gene_meta$gene_name)
+if (length(faltando) > 0) {
+  warning("Genes nao encontrados em gene_name: ", paste(faltando, collapse = ", "))
+}
+
+## --------------------------------------------------------------
+## 2) Classificar amostras em Tumor / Normal pelo barcode TCGA
+##    Formato: TCGA-XX-XXXX-SSV-... -> SS = codigo do tipo de amostra
+##    01-09 = tumoral (01 primario, 06 metastase etc.)
+##    10-19 = normal (11 = tecido normal solido, o mais comum)
+## --------------------------------------------------------------
+sample_info <- tibble(sample_id = sample_cols) %>%
+  mutate(
+    sample_type_code = str_extract(sample_id, "(?<=-)[0-9]{2}(?=[A-Z]-)"),
+    grupo = case_when(
+      as.numeric(sample_type_code) <= 9  ~ "Tumor",
+      as.numeric(sample_type_code) >= 10 ~ "Normal",
+      TRUE ~ NA_character_
+    )
+  )
+
+print(table(sample_info$grupo, useNA = "always"))
+# se aparecer NA aqui, confira manualmente o padrao dos barcodes que nao bateram
+
+## --------------------------------------------------------------
+## 3) Montar matriz de contagens (genes x amostras) para DESeq2
+##    usando TODOS os genes (normalizacao deve ser feita antes de
+##    subsetar a lista de interesse, para nao distorcer os fatores
+##    de tamanho de biblioteca)
+## --------------------------------------------------------------
+count_matrix <- counts %>%
+  select(all_of(sample_cols)) %>%
+  as.matrix()
+rownames(count_matrix) <- counts$Row.names
+storage.mode(count_matrix) <- "integer"
+
+coldata <- sample_info %>%
+  filter(!is.na(grupo)) %>%
+  column_to_rownames("sample_id")
+coldata$grupo <- factor(coldata$grupo, levels = c("Normal", "Tumor"))
+
+count_matrix <- count_matrix[, rownames(coldata)]  # garante mesma ordem/amostras
+
+dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                              colData   = coldata,
+                              design    = ~ grupo)
+
+# filtro leve de genes com contagem muito baixa (acelera e estabiliza o vst)
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+
+## --------------------------------------------------------------
+## Normalização -- OPÇÃO A (recomendada): vst do DESeq2
+## --------------------------------------------------------------
+vsd <- vst(dds, blind = TRUE)
+expr_norm <- assay(vsd)   # genes x amostras, escala log2-like
+
+## --------------------------------------------------------------
+## Normalização -- OPÇÃO B (mais rápida, CPM+log2 via edgeR)
+## Descomente se preferir nao rodar o DESeq2 completo
+## --------------------------------------------------------------
+# library(edgeR)
+# libsizes <- colSums(count_matrix)
+# cpm_mat  <- edgeR::cpm(count_matrix, lib.size = libsizes, log = TRUE, prior.count = 1)
+# expr_norm <- cpm_mat
+
+## --------------------------------------------------------------
+## 4) Subset dos 29 genes da rede + formato longo pra plot
+## --------------------------------------------------------------
+ensg_alvo <- gene_meta %>% filter(gene_name %in% network_nodes)
+
+expr_long <- as.data.frame(expr_norm) %>%
+  tibble::rownames_to_column("Row.names") %>%
+  filter(Row.names %in% ensg_alvo$Row.names) %>%
+  left_join(ensg_alvo, by = "Row.names") %>%
+  pivot_longer(cols = all_of(sample_cols[sample_cols %in% colnames(expr_norm)]),
+               names_to = "sample_id", values_to = "expressao") %>%
+  left_join(sample_info, by = "sample_id") %>%
+  filter(!is.na(grupo)) %>%
+  mutate(gene_name = factor(gene_name, levels = network_nodes))  # mantem ordem da lista original
+
+## --------------------------------------------------------------
+## 5) Teste estatístico por gene (Wilcoxon, Tumor vs Normal)
+##    + correção para múltiplas comparações (29 genes)
+## --------------------------------------------------------------
+testes <- expr_long %>%
+  group_by(gene_name) %>%
+  summarise(
+    p_valor = tryCatch(wilcox.test(expressao ~ grupo)$p.value, error = function(e) NA),
+    .groups = "drop"
+  ) %>%
+  mutate(p_ajustado = p.adjust(p_valor, method = "BH"))
+
+print(testes, n = 30)
+write.csv(testes, "wilcoxon_network_genes_tumor_vs_normal.csv", row.names = FALSE)
+
+## --------------------------------------------------------------
+## 6) Preparar anotação de significância (barra + asterisco)
+##    Usa o p ajustado (BH) já calculado no passo 5 -- assim a barra
+##    do gráfico é consistente com a tabela de testes exportada.
+##    ns = nao significativo, * <0.05, ** <0.01, *** <0.001
+## --------------------------------------------------------------
+signif_df <- expr_long %>%
+  group_by(gene_name) %>%
+  summarise(y_position = max(expressao, na.rm = TRUE) * 1.08, .groups = "drop") %>%
+  left_join(testes, by = "gene_name") %>%
+  mutate(
+    label = case_when(
+      is.na(p_ajustado)     ~ "NA",
+      p_ajustado < 0.001    ~ "***",
+      p_ajustado < 0.01     ~ "**",
+      p_ajustado < 0.05     ~ "*",
+      TRUE                  ~ "ns"
+    ),
+    xmin = "Normal",
+    xmax = "Tumor"
+  )
+
+## --------------------------------------------------------------
+## 7) Boxplots -- um painel por gene, com barra de significância
+## --------------------------------------------------------------
+p <- ggplot(expr_long, aes(x = grupo, y = expressao, fill = grupo)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 0.6, alpha = 0.4) +
+  geom_signif(
+    data = signif_df,
+    aes(xmin = xmin, xmax = xmax, y_position = y_position, annotations = label),
+    manual = TRUE, inherit.aes = FALSE, tip_length = 0.02, textsize = 3.2
+  ) +
+  facet_wrap(~ gene_name, scales = "free_y", ncol = 5) +
+  scale_fill_manual(values = c("Normal" = "#4C9F70", "Tumor" = "#C0392B")) +
+  # espaco extra no topo de cada painel pra barra nao cortar
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "top",
+        strip.text = element_text(face = "bold")) +
+  labs(x = NULL, y = "Expressão normalizada (vst)",
+       title = "Expressão dos genes da rede: Tumor vs. Normal",
+       caption = "Wilcoxon, p ajustado por Benjamini-Hochberg (ns / * <0.05 / ** <0.01 / *** <0.001)")
+
+ggsave("network_genes_tumor_vs_normal.png", p, width = 14, height = 15, dpi = 300)
+p
+```
+
+# 4. mRNAs/lncRNAs da rede: Radioterapia e Quimioterapia
+
+Restringe às amostras tumorais, liga cada amostra ao paciente (12 primeiros
+caracteres do barcode) e compara a expressão dos 29 genes por
+`teve_radioterapia` e por `teve_quimio`.
+
+```{r mrna-treatment, fig.width=14, fig.height=15}
+## Usa `expr_long` (chunk anterior) e `master` (secao 2)
+
+## --------------------------------------------------------------
+## 1) Restringir a amostras TUMORAIS e extrair o ID do paciente
+##    (12 primeiros caracteres do barcode: TCGA-XX-XXXX)
+## --------------------------------------------------------------
+expr_tumor <- expr_long %>%
+  filter(grupo == "Tumor") %>%
+  mutate(bcr_patient_barcode = str_sub(sample_id, 1, 12))
+
+# checagem: paciente com mais de 1 amostra tumoral (pseudo-replicacao)
+n_amostras_paciente <- expr_tumor %>%
+  distinct(bcr_patient_barcode, sample_id) %>%
+  count(bcr_patient_barcode) %>%
+  filter(n > 1)
+if (nrow(n_amostras_paciente) > 0) {
+  warning(nrow(n_amostras_paciente), " paciente(s) com mais de 1 amostra tumoral -- ",
+          "considere manter so 1 amostra/paciente antes de comparar por tratamento.")
+}
+
+## --------------------------------------------------------------
+## 2) Ligar ao master clínico (teve_radioterapia / teve_quimio)
+## --------------------------------------------------------------
+expr_tumor <- expr_tumor %>%
+  left_join(master %>% select(bcr_patient_barcode, teve_radioterapia, teve_quimio,
+                              lista_drogas, radio_radiation_therapy_type),
+            by = "bcr_patient_barcode")
+
+# quantos pacientes tumorais efetivamente tem info clinica pareada
+cat("Amostras tumorais sem match clinico:", sum(is.na(expr_tumor$teve_radioterapia)), "\n")
+
+## --------------------------------------------------------------
+## Função auxiliar: teste + boxplot com barra de significância
+## pra uma variável de estratificação binária (Yes/No)
+## --------------------------------------------------------------
+plot_por_tratamento <- function(df, var_grupo, titulo, arquivo_saida, arquivo_csv) {
+
+  df <- df %>% filter(!is.na(.data[[var_grupo]]))
+  df[[var_grupo]] <- factor(df[[var_grupo]], levels = c("No", "Yes"))
+
+  testes <- df %>%
+    group_by(gene_name) %>%
+    summarise(
+      n_no  = sum(.data[[var_grupo]] == "No"),
+      n_yes = sum(.data[[var_grupo]] == "Yes"),
+      p_valor = tryCatch(wilcox.test(expressao ~ .data[[var_grupo]])$p.value,
+                         error = function(e) NA),
+      .groups = "drop"
+    ) %>%
+    mutate(p_ajustado = p.adjust(p_valor, method = "BH"))
+
+  print(testes, n = 30)
+  write.csv(testes, arquivo_csv, row.names = FALSE)
+
+  signif_df <- df %>%
+    group_by(gene_name) %>%
+    summarise(y_position = max(expressao, na.rm = TRUE) * 1.08, .groups = "drop") %>%
+    left_join(testes, by = "gene_name") %>%
+    mutate(
+      label = case_when(
+        is.na(p_ajustado)  ~ "NA",
+        p_ajustado < 0.001 ~ "***",
+        p_ajustado < 0.01  ~ "**",
+        p_ajustado < 0.05  ~ "*",
+        TRUE               ~ "ns"
+      ),
+      xmin = "No", xmax = "Yes"
+    )
+
+  p <- ggplot(df, aes(x = .data[[var_grupo]], y = expressao, fill = .data[[var_grupo]])) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    geom_jitter(width = 0.15, size = 0.6, alpha = 0.4) +
+    geom_signif(
+      data = signif_df,
+      aes(xmin = xmin, xmax = xmax, y_position = y_position, annotations = label),
+      manual = TRUE, inherit.aes = FALSE, tip_length = 0.02, textsize = 3.2
+    ) +
+    facet_wrap(~ gene_name, scales = "free_y", ncol = 5) +
+    scale_fill_manual(values = c("No" = "#7F8C8D", "Yes" = "#2980B9")) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+    theme_bw(base_size = 10) +
+    theme(legend.position = "top", strip.text = element_text(face = "bold")) +
+    labs(x = NULL, y = "Expressão normalizada (vst)", title = titulo,
+         caption = "Wilcoxon, p ajustado por Benjamini-Hochberg (ns / * <0.05 / ** <0.01 / *** <0.001)")
+
+  ggsave(arquivo_saida, p, width = 14, height = 15, dpi = 300)
+  list(plot = p, testes = testes)
+}
+```
+
+## 4.1 Radioterapia (Sim vs. Não)
+
+```{r mrna-radioterapia, fig.width=14, fig.height=15}
+cat("\n--- Radioterapia ---\n")
+print(table(distinct(expr_tumor, bcr_patient_barcode, teve_radioterapia)$teve_radioterapia))
+
+res_radio <- plot_por_tratamento(
+  expr_tumor, "teve_radioterapia",
+  "Expressão dos genes da rede: Radioterapia (Sim vs. Não)",
+  "network_genes_radioterapia.png",
+  "wilcoxon_network_genes_radioterapia.csv"
+)
+res_radio$plot
+```
+
+## 4.2 Quimioterapia (Sim vs. Não)
+
+```{r mrna-quimioterapia, fig.width=14, fig.height=15}
+cat("\n--- Quimioterapia ---\n")
+print(table(distinct(expr_tumor, bcr_patient_barcode, teve_quimio)$teve_quimio))
+
+res_quimio <- plot_por_tratamento(
+  expr_tumor, "teve_quimio",
+  "Expressão dos genes da rede: Quimioterapia (Sim vs. Não)",
+  "network_genes_quimioterapia.png",
+  "wilcoxon_network_genes_quimioterapia.csv"
+)
+res_quimio$plot
+```
+
+# 5. hsa-miR-204: Tumor vs. Normal, Radioterapia e Quimioterapia
+
+Mesmos 3 comparativos feitos para os mRNAs/lncRNAs, agora para o miRNA
+`r mirna_alvo`, usando `mirnaseq_counts` (raw counts, coluna de ID =
+`miRNA_ID`) e o `master` clínico já construído.
+
+```{r mirna-prep}
+sample_cols_mi <- setdiff(names(mirnaseq_counts), "miRNA_ID")
+
+stopifnot(mirna_alvo %in% rownames(mirnaseq_counts))
+
+## --------------------------------------------------------------
+## 1) Classificar amostras em Tumor / Normal pelo barcode TCGA
+##    (mesma lógica usada para o counts de mRNA)
+## --------------------------------------------------------------
+sample_info_mi <- tibble(sample_id = sample_cols_mi) %>%
+  mutate(
+    sample_type_code = str_extract(sample_id, "(?<=-)[0-9]{2}(?=[A-Z]-)"),
+    grupo = case_when(
+      as.numeric(sample_type_code) <= 9  ~ "Tumor",
+      as.numeric(sample_type_code) >= 10 ~ "Normal",
+      TRUE ~ NA_character_
+    )
+  )
+print(table(sample_info_mi$grupo, useNA = "always"))
+
+## --------------------------------------------------------------
+## 2) Normalizar (vst) usando a matriz COMPLETA de miRNAs
+##    (mesmo racional: normalização antes de subsetar o alvo)
+## --------------------------------------------------------------
+count_matrix_mi <- mirnaseq_counts %>%
+  select(all_of(sample_cols_mi)) %>%
+  as.matrix()
+#rownames(count_matrix_mi) <- mirnaseq_counts$miRNA_ID
+storage.mode(count_matrix_mi) <- "integer"
+
+coldata_mi <- sample_info_mi %>%
+  filter(!is.na(grupo)) %>%
+  column_to_rownames("sample_id")
+coldata_mi$grupo <- factor(coldata_mi$grupo, levels = c("Normal", "Tumor"))
+
+count_matrix_mi <- count_matrix_mi[, rownames(coldata_mi)]
+
+dds_mi <- DESeqDataSetFromMatrix(countData = count_matrix_mi,
+                                 colData   = coldata_mi,
+                                 design    = ~ grupo)
+dds_mi <- dds_mi[rowSums(counts(dds_mi)) >= 10, ]
+vsd_mi <- varianceStabilizingTransformation(dds_mi, blind = TRUE)
+expr_norm_mi <- assay(vsd_mi)
+
+stopifnot(mirna_alvo %in% rownames(expr_norm_mi))  # confere que sobreviveu ao filtro de baixa contagem
+
+## --------------------------------------------------------------
+## 3) Formato longo só para o miRNA alvo
+## --------------------------------------------------------------
+expr_long_mi <- as.data.frame(expr_norm_mi) %>%
+  tibble::rownames_to_column("miRNA_ID") %>%
+  filter(miRNA_ID == mirna_alvo) %>%
+  pivot_longer(cols = -miRNA_ID, names_to = "sample_id", values_to = "expressao") %>%
+  left_join(sample_info_mi, by = "sample_id") %>%
+  filter(!is.na(grupo))
+
+## --------------------------------------------------------------
+## Função auxiliar: teste + boxplot com barra de significância
+## (versão para um único gene/miRNA, sem facet)
+## --------------------------------------------------------------
+plot_unico <- function(df, var_grupo, niveis, cores, titulo, arquivo_saida, arquivo_csv) {
+
+  df <- df %>% filter(!is.na(.data[[var_grupo]]))
+  df[[var_grupo]] <- factor(df[[var_grupo]], levels = niveis)
+
+  teste <- tryCatch(wilcox.test(expressao ~ df[[var_grupo]], data = df), error = function(e) NULL)
+  p_valor <- if (!is.null(teste)) teste$p.value else NA
+  label <- case_when(
+    is.na(p_valor)  ~ "NA",
+    p_valor < 0.001 ~ "***",
+    p_valor < 0.01  ~ "**",
+    p_valor < 0.05  ~ "*",
+    TRUE            ~ "ns"
+  )
+
+  resumo <- df %>%
+    group_by(.data[[var_grupo]]) %>%
+    summarise(n = n(), mediana = median(expressao), .groups = "drop")
+  resumo$p_valor <- p_valor
+  write.csv(resumo, arquivo_csv, row.names = FALSE)
+  print(resumo)
+
+  y_pos <- max(df$expressao, na.rm = TRUE) * 1.08
+
+  p <- ggplot(df, aes(x = .data[[var_grupo]], y = expressao, fill = .data[[var_grupo]])) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+    geom_jitter(width = 0.15, size = 1, alpha = 0.5) +
+    geom_signif(comparisons = list(niveis), annotations = label,
+                y_position = y_pos, tip_length = 0.02, textsize = 4) +
+    scale_fill_manual(values = cores) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "none") +
+    labs(x = NULL, y = "Expressão normalizada (vst)", title = titulo,
+         caption = paste0("Wilcoxon, p = ", signif(p_valor, 3)))
+
+  ggsave(arquivo_saida, p, width = 5, height = 5, dpi = 300)
+  list(plot = p, resumo = resumo)
+}
+```
+
+## 5.1 Tumor vs. Normal
+
+```{r mirna-tumor-normal, fig.width=5, fig.height=5}
+res_mi_tn <- plot_unico(
+  expr_long_mi, "grupo", c("Normal", "Tumor"),
+  c("Normal" = "#4C9F70", "Tumor" = "#C0392B"),
+  paste0(mirna_alvo, ": Tumor vs. Normal"),
+  "mir204_tumor_vs_normal.png", "wilcoxon_mir204_tumor_vs_normal.csv"
+)
+res_mi_tn$plot
+```
+
+```{r mirna-tumor-prep}
+## Preparar subset tumoral + link com clinico (radio/quimio)
+expr_mi_tumor <- expr_long_mi %>%
+  filter(grupo == "Tumor") %>%
+  mutate(bcr_patient_barcode = str_sub(sample_id, 1, 12)) %>%
+  left_join(master %>% select(bcr_patient_barcode, teve_radioterapia, teve_quimio),
+            by = "bcr_patient_barcode")
+```
+
+## 5.2 Radioterapia (Sim vs. Não)
+
+```{r mirna-radioterapia, fig.width=5, fig.height=5}
+res_mi_radio <- plot_unico(
+  expr_mi_tumor, "teve_radioterapia", c("No", "Yes"),
+  c("No" = "#7F8C8D", "Yes" = "#2980B9"),
+  paste0(mirna_alvo, ": Radioterapia (Sim vs. Não)"),
+  "mir204_radioterapia.png", "wilcoxon_mir204_radioterapia.csv"
+)
+res_mi_radio$plot
+```
+
+## 5.3 Quimioterapia (Sim vs. Não)
+
+```{r mirna-quimioterapia, fig.width=5, fig.height=5}
+res_mi_quimio <- plot_unico(
+  expr_mi_tumor, "teve_quimio", c("No", "Yes"),
+  c("No" = "#7F8C8D", "Yes" = "#2980B9"),
+  paste0(mirna_alvo, ": Quimioterapia (Sim vs. Não)"),
+  "mir204_quimioterapia.png", "wilcoxon_mir204_quimioterapia.csv"
+)
+res_mi_quimio$plot
+```
+
+# 6. Figuras combinadas (mRNAs/lncRNAs + miR-204 juntos)
+
+Une as 29 features de RNA-seq com o `r mirna_alvo` num só grid por
+comparação — 30 painéis, um por feature — em vez de ter o mRNA/lncRNA
+separado do miRNA como nas seções 3–5. Reaproveita os objetos já calculados
+(`expr_long`, `expr_tumor`, `expr_long_mi`, `expr_mi_tumor`) e a função
+`plot_por_tratamento()` definida na seção 4.
+
+```{r combine-features}
+## Junta os data frames de mRNA/lncRNA e miRNA renomeando a coluna de ID
+## do miRNA para "gene_name", e recria o fator com as 30 features na
+## ordem: 29 genes da rede (ordem original) + miR-204 por último.
+niveis_features <- c(as.character(network_nodes), mirna_alvo)
+
+## --------------------------------------------------------------
+## 6.1 Tumor vs. Normal -- combinado
+## --------------------------------------------------------------
+combined_tn <- bind_rows(
+  expr_long %>%
+    mutate(gene_name = as.character(gene_name)) %>%
+    select(gene_name, sample_id, grupo, expressao),
+  expr_long_mi %>%
+    rename(gene_name = miRNA_ID) %>%
+    select(gene_name, sample_id, grupo, expressao)
+) %>%
+  mutate(gene_name = factor(gene_name, levels = niveis_features))
+
+testes_tn <- combined_tn %>%
+  group_by(gene_name) %>%
+  summarise(
+    p_valor = tryCatch(wilcox.test(expressao ~ grupo)$p.value, error = function(e) NA),
+    .groups = "drop"
+  ) %>%
+  mutate(p_ajustado = p.adjust(p_valor, method = "BH"))
+
+write.csv(testes_tn, "wilcoxon_combined_tumor_vs_normal.csv", row.names = FALSE)
+
+signif_tn <- combined_tn %>%
+  group_by(gene_name) %>%
+  summarise(y_position = max(expressao, na.rm = TRUE) * 1.08, .groups = "drop") %>%
+  left_join(testes_tn, by = "gene_name") %>%
+  mutate(
+    label = case_when(
+      is.na(p_ajustado)  ~ "NA",
+      p_ajustado < 0.001 ~ "***",
+      p_ajustado < 0.01  ~ "**",
+      p_ajustado < 0.05  ~ "*",
+      TRUE               ~ "ns"
+    ),
+    xmin = "Normal", xmax = "Tumor"
+  )
+
+p_combined_tn <- ggplot(combined_tn, aes(x = grupo, y = expressao, fill = grupo)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 0.5, alpha = 0.35) +
+  geom_signif(
+    data = signif_tn,
+    aes(xmin = xmin, xmax = xmax, y_position = y_position, annotations = label),
+    manual = TRUE, inherit.aes = FALSE, tip_length = 0.02, textsize = 3
+  ) +
+  facet_wrap(~ gene_name, scales = "free_y", ncol = 7) +
+  scale_fill_manual(values = c("Normal" = "#4C9F70", "Tumor" = "#C0392B")) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  theme_bw(base_size = 9) +
+  theme(legend.position = "top", strip.text = element_text(face = "bold", size = 8)) +
+  labs(x = NULL, y = "Normalized Expression (vst)",
+       title = "mRNAs/lncRNAs + miR-204: Tumor vs. Normal",
+       caption = "Wilcoxon, p-adjusted by Benjamini-Hochberg (ns / * <0.05 / ** <0.01 / *** <0.001)")
+
+ggsave("combined_features_tumor_vs_normal.png", p_combined_tn, width = 16, height = 15, dpi = 300)
+```
+
+```{r combined-tumor-normal-plot, fig.width=16, fig.height=15}
+p_combined_tn
+```
+
+## 6.2 Radioterapia e Quimioterapia -- combinado
+
+```{r combine-features-treatment}
+combined_tumor <- bind_rows(
+  expr_tumor %>%
+    mutate(gene_name = as.character(gene_name)) %>%
+    select(gene_name, sample_id, grupo, expressao, bcr_patient_barcode,
+           teve_radioterapia, teve_quimio),
+  expr_mi_tumor %>%
+    rename(gene_name = miRNA_ID) %>%
+    select(gene_name, sample_id, grupo, expressao, bcr_patient_barcode,
+           teve_radioterapia, teve_quimio)
+) %>%
+  mutate(gene_name = factor(gene_name, levels = niveis_features))
+```
+
+```{r combined-radioterapia, fig.width=16, fig.height=15}
+res_combined_radio <- plot_por_tratamento(
+  combined_tumor, "teve_radioterapia",
+  "mRNAs/lncRNAs + miR-204: Radioterapia (Sim vs. Não)",
+  "combined_features_radioterapia.png",
+  "wilcoxon_combined_radioterapia.csv"
+)
+res_combined_radio$plot
+```
+
+```{r combined-quimioterapia, fig.width=16, fig.height=15}
+res_combined_quimio <- plot_por_tratamento(
+  combined_tumor, "teve_quimio",
+  "mRNAs/lncRNAs + miR-204: Quimioterapia (Sim vs. Não)",
+  "combined_features_quimioterapia.png",
+  "wilcoxon_combined_quimioterapia.csv"
+)
+res_combined_quimio$plot
+```
